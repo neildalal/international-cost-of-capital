@@ -170,37 +170,91 @@ def fetch_bbb_spread() -> dict:
     return {"data": spread, "as_of": m.group(1) if m else "n/a", "fetched_at": _now()}
 
 
+OECD_API_URL = ("https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,/all"
+                "?startPeriod=2022&dimensionAtObservation=AllDimensions&format=csvfilewithlabels")
+TE_API_URL = "https://api.tradingeconomics.com/markets/bond"
+FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={}"
+
+# FRED series IRLTLT01{ISO2}M156N = OECD long-term (10Y) government bond yield, monthly.
+FRED_ISO2 = {
+    "Australia": "AU", "Austria": "AT", "Belgium": "BE", "Brazil": "BR", "Canada": "CA",
+    "Chile": "CL", "China": "CN", "Colombia": "CO", "Czech Republic": "CZ", "Denmark": "DK",
+    "Estonia": "EE", "Finland": "FI", "France": "FR", "Germany": "DE", "Greece": "GR",
+    "Hungary": "HU", "Iceland": "IS", "India": "IN", "Indonesia": "ID", "Ireland": "IE",
+    "Israel": "IL", "Italy": "IT", "Japan": "JP", "South Korea": "KR", "Latvia": "LV",
+    "Lithuania": "LT", "Luxembourg": "LU", "Mexico": "MX", "Netherlands": "NL",
+    "New Zealand": "NZ", "Norway": "NO", "Poland": "PL", "Portugal": "PT", "Russia": "RU",
+    "Slovakia": "SK", "Slovenia": "SI", "South Africa": "ZA", "Spain": "ES", "Sweden": "SE",
+    "Switzerland": "CH", "Turkey": "TR", "United Kingdom": "GB",
+}
+ALIASES["hong kong china"] = "hong kong"
+
+
+def _tax_from_api() -> tuple[dict, str]:
+    """OECD Data Explorer SDMX API: combined (S13) statutory CIT rate, latest year."""
+    r = requests.get(OECD_API_URL, headers={**HEADERS, "Accept": "text/csv"}, timeout=90)
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    exact = {c.upper(): c for c in df.columns}
+    exact.update({c: c for c in df.columns if c == c.upper()})   # prefer code columns over labels
+
+    def keep(dim: str, value: str) -> None:
+        nonlocal df
+        if dim in exact:
+            sub = df[df[exact[dim]].astype(str) == value]
+            if not sub.empty:
+                df = sub
+
+    keep("MEASURE", "CIT")
+    keep("TARGETING", "ST")                 # statutory rate
+    keep("INSTITUTIONAL_SECTOR", "S13")     # general government = combined central + sub-central
+    name_col = next((c for c in df.columns if c.lower() == "reference area"), exact.get("REF_AREA"))
+    df = df.assign(_y=pd.to_numeric(df[exact["TIME_PERIOD"]], errors="coerce"),
+                   _v=pd.to_numeric(df[exact["OBS_VALUE"]], errors="coerce")).dropna(subset=["_y", "_v"])
+    df = df.sort_values("_y").groupby(name_col).tail(1)
+    div = 1 if df["_v"].max() <= 1.0 else 100      # OECD reports percent (25.77); convert to decimal
+    data = {norm(n): v / div for n, v in zip(df[name_col], df["_v"])}
+    return data, str(int(df["_y"].max()))
+
+
+def _tax_from_page() -> tuple[dict, str]:
+    """Scrape the OECD publication page (works only if the table is in the static HTML)."""
+    html = _get(OECD_URL).text
+    for t in pd.read_html(io.StringIO(html)):
+        first = t.iloc[:, 0].astype(str)
+        if first.str.contains("Australia").any() and first.str.contains("United States").any():
+            years = [c for c in t.columns if re.fullmatch(r"\d{4}", str(c).strip())]
+            if not years:
+                continue
+            ycol = sorted(years, key=lambda c: int(str(c).strip()))[-1]
+            vals = pd.to_numeric(t[ycol].astype(str).str.extract(r"(\d+(?:\.\d+)?)")[0], errors="coerce")
+            div = 1 if vals.max() <= 1.0 else 100
+            return ({norm(n): v / div for n, v in zip(first, vals) if pd.notna(v)},
+                    str(ycol).strip())
+    raise ValueError("no statutory-rate table found in the page HTML")
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_tax_rates() -> dict:
-    """OECD statutory CIT rates. Tries the live page; falls back to an embedded OECD table."""
-    try:
-        html = _get(OECD_URL).text
-        for t in pd.read_html(io.StringIO(html)):
-            first = t.iloc[:, 0].astype(str)
-            if first.str.contains("Australia").any() and first.str.contains("United States").any():
-                years = [c for c in t.columns if re.fullmatch(r"\d{4}", str(c).strip())]
-                if not years:
-                    continue
-                ycol = sorted(years, key=lambda c: int(str(c).strip()))[-1]
-                vals = pd.to_numeric(t[ycol].astype(str).str.extract(r"(\d+(?:\.\d+)?)")[0],
-                                     errors="coerce")
-                scale = 100 if vals.max() <= 1.0 else 1
-                data = {norm(n): v / scale for n, v in zip(first, vals) if pd.notna(v)}
-                if len(data) > 20:
-                    return {"data": data, "as_of": f"{str(ycol).strip()} rates",
-                            "fetched_at": _now(), "fallback": False}
-    except Exception:  # noqa: BLE001 - fall through to the embedded table
-        pass
+    """OECD statutory CIT rates: Data Explorer API -> publication page -> embedded table."""
+    errors = []
+    for label, fn in [("OECD Data Explorer API", _tax_from_api),
+                      ("OECD publication page", _tax_from_page)]:
+        try:
+            data, year = fn()
+            if len(data) > 20 and "united states" in data:
+                return {"data": data, "as_of": f"{year} rates", "fetched_at": _now(),
+                        "method": label, "fallback": False, "errors": errors}
+            errors.append(f"{label}: too few rows parsed ({len(data)})")
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{label}: {type(e).__name__}: {str(e)[:120]}")
     data = {norm(k): v / 100 for k, v in OECD_FALLBACK_PCT.items()}
     return {"data": data, "as_of": "2024 rates (embedded OECD CTS 2024 table)",
-            "fetched_at": _now(), "fallback": True}
+            "fetched_at": _now(), "method": "Embedded table", "fallback": True, "errors": errors}
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_yields() -> dict:
-    """Trading Economics 10-year government bond yields (decimal) by country name."""
-    r = _get(TE_URL)
-    soup = BeautifulSoup(r.text, "lxml")
+def _yields_te_page() -> tuple[dict, dict]:
+    soup = BeautifulSoup(_get(TE_URL).text, "lxml")
     yields: dict[str, float] = {}
     dates: dict[str, str] = {}
     for tr in soup.find_all("tr"):
@@ -209,21 +263,98 @@ def fetch_yields() -> dict:
             continue
         country = a.get_text(" ", strip=True)
         cells = [c.get_text(" ", strip=True) for c in tr.find_all("td")]
-        value = None
         for c in cells[1:]:
             try:
                 value = float(c.replace("%", "").replace(",", ""))
-                break
             except ValueError:
                 continue
-        if country and value is not None and country not in yields:
-            yields[country] = value / 100
-            dates[country] = cells[-1] if cells else ""
+            if country and country not in yields:
+                yields[country] = value / 100
+                dates[country] = cells[-1] if cells else ""
+            break
     if not yields:
-        raise ValueError("No 10-year yields could be parsed from tradingeconomics.com/bonds")
-    us_date = dates.get("United States", "")
-    return {"data": yields, "dates": dates, "as_of": us_date or "latest quote",
-            "fetched_at": _now()}
+        raise ValueError("page loaded but no yield rows were found (table may be JS-rendered)")
+    return yields, dates
+
+
+def _yields_te_api() -> tuple[dict, dict]:
+    r = requests.get(TE_API_URL, params={"c": "guest:guest", "f": "json"}, headers=HEADERS,
+                     timeout=30)
+    r.raise_for_status()
+    yields, dates = {}, {}
+    for row in r.json():
+        if str(row.get("URL", "")).endswith("/government-bond-yield") and row.get("Last") is not None:
+            yields[row["Country"]] = float(row["Last"]) / 100
+            dates[row["Country"]] = str(row.get("Date", ""))[:10]
+    if not yields:
+        raise ValueError("API returned no 10Y bond rows")
+    return yields, dates
+
+
+def _fred_last(series_id: str) -> tuple[float, str] | None:
+    r = requests.get(FRED_CSV.format(series_id), headers=HEADERS, timeout=25)
+    if r.status_code != 200:
+        return None
+    df = pd.read_csv(io.StringIO(r.text))
+    df = df.assign(_v=pd.to_numeric(df.iloc[:, 1], errors="coerce")).dropna(subset=["_v"])
+    if df.empty:
+        return None
+    return float(df["_v"].iloc[-1]) / 100, str(df.iloc[-1, 0])
+
+
+def _yields_fred() -> tuple[dict, dict]:
+    from concurrent.futures import ThreadPoolExecutor
+    jobs = {"United States": "DGS10", **{c: f"IRLTLT01{iso}M156N" for c, iso in FRED_ISO2.items()}}
+
+    def one(item):
+        try:
+            return item[0], _fred_last(item[1])
+        except Exception:  # noqa: BLE001
+            return item[0], None
+
+    yields, dates = {}, {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for country, res in ex.map(one, jobs.items()):
+            if res:
+                yields[country], dates[country] = res
+    if not yields:
+        raise ValueError("no series could be downloaded")
+    return yields, dates
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_yields() -> dict:
+    """10-year yields (decimal). Trading Economics page -> TE guest API -> FRED/OECD monthly.
+
+    Sources are merged by priority so a country missing from one layer is filled by the next.
+    """
+    layers = [("Trading Economics (page)", _yields_te_page),
+              ("Trading Economics (guest API)", _yields_te_api),
+              ("FRED / OECD monthly", _yields_fred)]
+    yields: dict[str, float] = {}
+    dates: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    errors: list[str] = []
+    for label, fn in layers:
+        if label.startswith("Trading Economics (guest") and len(yields) >= 30:
+            continue
+        if label.startswith("FRED") and len(yields) >= 30:
+            continue
+        try:
+            y, d = fn()
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{label}: {type(e).__name__}: {str(e)[:120]}")
+            continue
+        for country, v in y.items():
+            if country not in yields:
+                yields[country], dates[country], sources[country] = v, d.get(country, ""), label
+    if not yields:
+        raise ValueError(" | ".join(errors) or "no yield source reachable")
+    used = sorted(set(sources.values()))
+    return {"data": yields, "dates": dates, "sources": sources, "errors": errors,
+            "method": " + ".join(used),
+            "degraded": "Trading Economics (page)" not in used,
+            "as_of": dates.get("United States", "") or "latest quote", "fetched_at": _now()}
 
 
 def safe(fn):
@@ -470,24 +601,32 @@ def main() -> None:
                  r"s^{FC}_{auto}=(1+K_d^{USD})\frac{1+R_f^{FC}}{1+R_f^{US}}-1-R_f^{FC}")
 
     # ---- Inputs used --------------------------------------------------------- #
-    def src(manual: bool, label: str) -> str:
-        return "✏️ Manual" if manual else label
+    ysrc = (yld_r or {}).get("sources", {})
+    ydate = (yld_r or {}).get("dates", {})
 
+    def row(name, value, manual, source, date=""):
+        return (name, value, "✏️ Manual" if manual else source, "—" if manual else (date or "—"))
+
+    b_date = betas_r["as_of"] if betas_r else ""
+    t_date = tax_r["as_of"] if tax_r else ""
+    s_date = spread_r["as_of"] if spread_r else ""
+    t_src = "OECD" + (" (embedded table)" if tax_r and tax_r.get("fallback") else "")
     inputs = pd.DataFrame([
-        ("Unlevered beta", f"{beta_u:.3f}", src(beta_man, "Damodaran")),
-        ("Relevered beta", f"{res['beta_l']:.3f}", "Calculated"),
-        ("Tax rate used", pct(tax),
-         src(tax_us_man if tax_choice == "U.S." else tax_fc_man, "OECD")),
-        ("U.S. tax rate", pct(tax_us), src(tax_us_man, "OECD")),
-        (f"{country} tax rate", pct(tax_fc), src(tax_fc_man, "OECD")),
-        ("USD BBB spread", pct(spread_us), src(spread_us_man, "Damodaran")),
-        (f"{country} BBB spread", pct(res["spread_fc_used"]),
-         "✏️ Manual" if fc_spread_manual else "Calculated (auto)"),
-        ("U.S. 10Y yield", pct(rf_us), src(rf_us_man, "Trading Economics")),
-        (f"{country} 10Y yield", pct(rf_fc), src(rf_fc_man, "Trading Economics")),
-        ("Equity risk premium", pct(erp), "User input"),
-        ("Debt share (D/V)", pct(debt), "User input"),
-    ], columns=["Input", "Value", "Source"])
+        row("Unlevered beta", f"{beta_u:.3f}", beta_man, "Damodaran", b_date),
+        ("Relevered beta", f"{res['beta_l']:.3f}", "Calculated", "—"),
+        row("Tax rate used", pct(tax), tax_us_man if tax_choice == "U.S." else tax_fc_man, t_src, t_date),
+        row("U.S. tax rate", pct(tax_us), tax_us_man, t_src, t_date),
+        row(f"{country} tax rate", pct(tax_fc), tax_fc_man, t_src, t_date),
+        row("USD BBB spread", pct(spread_us), spread_us_man, "Damodaran", s_date),
+        row(f"{country} BBB spread", pct(res["spread_fc_used"]), fc_spread_manual,
+            "Calculated (auto)", ""),
+        row("U.S. 10Y yield", pct(rf_us), rf_us_man, ysrc.get("United States", "Trading Economics"),
+            ydate.get("United States", "")),
+        row(f"{country} 10Y yield", pct(rf_fc), rf_fc_man, ysrc.get(country, "Trading Economics"),
+            ydate.get(country, "")),
+        ("Equity risk premium", pct(erp), "User input", "—"),
+        ("Debt share (D/V)", pct(debt), "User input", "—"),
+    ], columns=["Input", "Value", "Source", "Data date"])
     with st.expander("🧾 Inputs used"):
         st.dataframe(inputs, hide_index=True, width="stretch")
 
@@ -553,20 +692,23 @@ def main() -> None:
 
 
 def render_sources(betas_r, betas_err, spread_r, spread_err, tax_r, tax_err, yld_r, yld_err) -> None:
-    def row(name, url, r, err, note=""):
+    def row(name, url, r, err):
         if err:
             return dict(Source=name, **{"Data date": "—", "Fetched": "—"},
-                        Status=f"⚠️ Failed ({err[:80]}) — use manual inputs", Link=url)
-        status = "⚠️ Fallback table (live page not parsed)" if r.get("fallback") else "✅ Live"
+                        Status=f"❌ Failed — enter manually. {err[:200]}", Link=url)
+        method = r.get("method")
+        degraded = r.get("fallback") or r.get("degraded")
+        status = ("⚠️ Fallback: " if degraded else "✅ Live: ") + (method or "direct download")
+        if r.get("errors"):
+            status += " (tried first: " + "; ".join(r["errors"])[:260] + ")"
         return dict(Source=name, **{"Data date": r["as_of"], "Fetched": r["fetched_at"]},
-                    Status=(status + (f" — {note}" if note else "")), Link=url)
+                    Status=status, Link=url)
 
     rows = [
         row("Damodaran — unlevered industry betas", BETAS_URL, betas_r, betas_err),
         row("Damodaran — Baa2/BBB spread (large non-financial firms)", RATINGS_URL, spread_r, spread_err),
         row("OECD — statutory corporate tax rates", OECD_URL, tax_r, tax_err),
-        row("Trading Economics — 10-year government yields", TE_URL, yld_r, yld_err,
-            "date shown is the U.S. quote date" if yld_r else ""),
+        row("Trading Economics — 10-year government yields (U.S. quote date shown)", TE_URL, yld_r, yld_err),
     ]
     st.subheader("Sources & data dates")
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
