@@ -172,8 +172,13 @@ OECD_API_URL = ("https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT
                 "?startPeriod=2022&dimensionAtObservation=AllDimensions&format=csvfilewithlabels")
 TE_BULK_URL = "https://tradingeconomics.com/forecast/government-bond-10y"   # static table, 22 majors
 TE_COUNTRY_URL = "https://tradingeconomics.com/{slug}/government-bond-yield"       # one country
-# Countries that usually have a 10-year yield page on Trading Economics (fetched on demand).
-TE_EXTRA_COUNTRIES = [
+# Countries offered in the dropdown. Majors first (they are also in the bulk table), then others
+# that normally have a Trading Economics 10-year page. Fixed list, so the dropdown never depends
+# on a fetch succeeding; yields are scraped from the bulk table or the country's own page.
+TE_COUNTRIES = [
+    "United States", "United Kingdom", "Japan", "Australia", "Germany", "Brazil", "Russia", "India",
+    "Canada", "Italy", "France", "South Africa", "China", "Switzerland", "Mexico", "Greece",
+    "Netherlands", "New Zealand", "Portugal", "South Korea", "Spain", "Turkey",
     "Argentina", "Austria", "Bahrain", "Bangladesh", "Belgium", "Botswana", "Bulgaria", "Chile",
     "Colombia", "Croatia", "Cyprus", "Czech Republic", "Denmark", "Egypt", "Estonia", "Finland",
     "Hong Kong", "Hungary", "Iceland", "Indonesia", "Ireland", "Israel", "Jordan", "Kenya", "Latvia",
@@ -416,7 +421,7 @@ def main() -> None:
     yfail: list[str] = []
 
     industries = list(betas_df["industry"]) or [DEFAULT_INDUSTRY]
-    countries = sorted(set(yields) | set(TE_EXTRA_COUNTRIES) | {DEFAULT_COUNTRY})
+    countries = sorted(set(yields) | set(TE_COUNTRIES) | {DEFAULT_COUNTRY})
 
     # ---- Sidebar: core inputs -------------------------------------------- #
     with st.sidebar:
