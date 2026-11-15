@@ -95,8 +95,8 @@ def norm(name: str) -> str:
 # --------------------------------------------------------------------------- #
 # Data fetching (each cached for 1 hour; the Refresh button clears the cache)
 # --------------------------------------------------------------------------- #
-def _get(url: str) -> requests.Response:
-    r = requests.get(url, headers=HEADERS, timeout=40)
+def _get(url: str, timeout: int = 15) -> requests.Response:
+    r = requests.get(url, headers=HEADERS, timeout=timeout)
     r.raise_for_status()
     return r
 
@@ -108,10 +108,9 @@ def _now() -> str:
 MONTHS = "January|February|March|April|May|June|July|August|September|October|November|December"
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_betas() -> dict:
     """Damodaran industry betas: returns DataFrame[industry, unlevered_beta] + as-of date."""
-    r = _get(BETAS_URL)
+    r = _get(BETAS_URL, 30)
     sheets = pd.read_excel(io.BytesIO(r.content), sheet_name=None, header=None)
 
     candidates = []
@@ -150,7 +149,6 @@ def fetch_betas() -> dict:
     return {"data": out, "as_of": as_of, "fetched_at": _now()}
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_bbb_spread() -> dict:
     """Damodaran synthetic-rating table: Baa2/BBB spread for large non-financial firms."""
     r = _get(RATINGS_URL)
@@ -192,7 +190,7 @@ ALIASES["hong kong china"] = "hong kong"
 
 def _tax_from_api() -> tuple[dict, str]:
     """OECD Data Explorer SDMX API: combined (S13) statutory CIT rate, latest year."""
-    r = requests.get(OECD_API_URL, headers={**HEADERS, "Accept": "text/csv"}, timeout=90)
+    r = requests.get(OECD_API_URL, headers={**HEADERS, "Accept": "text/csv"}, timeout=30)
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
     exact = {c.upper(): c for c in df.columns}
@@ -234,7 +232,6 @@ def _tax_from_page() -> tuple[dict, str]:
     raise ValueError("no statutory-rate table found in the page HTML")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_tax_rates() -> dict:
     """OECD statutory CIT rates: Data Explorer API -> publication page -> embedded table."""
     errors = []
@@ -279,7 +276,7 @@ def _yields_te_page() -> tuple[dict, dict]:
 
 def _yields_te_api() -> tuple[dict, dict]:
     r = requests.get(TE_API_URL, params={"c": "guest:guest", "f": "json"}, headers=HEADERS,
-                     timeout=30)
+                     timeout=15)
     r.raise_for_status()
     yields, dates = {}, {}
     for row in r.json():
@@ -292,7 +289,7 @@ def _yields_te_api() -> tuple[dict, dict]:
 
 
 def _fred_last(series_id: str) -> tuple[float, str] | None:
-    r = requests.get(FRED_CSV.format(series_id), headers=HEADERS, timeout=25)
+    r = requests.get(FRED_CSV.format(series_id), headers=HEADERS, timeout=8)
     if r.status_code != 200:
         return None
     df = pd.read_csv(io.StringIO(r.text))
@@ -313,7 +310,7 @@ def _yields_fred() -> tuple[dict, dict]:
             return item[0], None
 
     yields, dates = {}, {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=16) as ex:
         for country, res in ex.map(one, jobs.items()):
             if res:
                 yields[country], dates[country] = res
@@ -322,7 +319,6 @@ def _yields_fred() -> tuple[dict, dict]:
     return yields, dates
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_yields() -> dict:
     """10-year yields (decimal). Trading Economics page -> TE guest API -> FRED/OECD monthly.
 
@@ -362,6 +358,17 @@ def safe(fn):
         return fn(), None
     except Exception as e:  # noqa: BLE001
         return None, f"{type(e).__name__}: {e}"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_all() -> dict:
+    """Fetch all four sources in parallel; each entry is (result, error_message)."""
+    from concurrent.futures import ThreadPoolExecutor
+    jobs = {"betas": fetch_betas, "spread": fetch_bbb_spread,
+            "tax": fetch_tax_rates, "yields": fetch_yields}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {k: ex.submit(safe, fn) for k, fn in jobs.items()}
+        return {k: f.result() for k, f in futures.items()}
 
 
 # --------------------------------------------------------------------------- #
@@ -436,10 +443,12 @@ def main() -> None:
                 "another country, using the same tax rate, debt share and equity risk premium.")
 
     # ---- Load data -------------------------------------------------------- #
-    betas_r, betas_err = safe(fetch_betas)
-    spread_r, spread_err = safe(fetch_bbb_spread)
-    tax_r, tax_err = safe(fetch_tax_rates)
-    yld_r, yld_err = safe(fetch_yields)
+    with st.spinner("Fetching data from Damodaran, OECD and Trading Economics…"):
+        loaded = load_all()
+    betas_r, betas_err = loaded["betas"]
+    spread_r, spread_err = loaded["spread"]
+    tax_r, tax_err = loaded["tax"]
+    yld_r, yld_err = loaded["yields"]
 
     betas_df = betas_r["data"] if betas_r else pd.DataFrame(columns=["industry", "unlevered_beta"])
     spread_fetched = spread_r["data"] if spread_r else None
