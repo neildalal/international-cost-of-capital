@@ -170,21 +170,17 @@ def fetch_bbb_spread() -> dict:
 
 OECD_API_URL = ("https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,/all"
                 "?startPeriod=2022&dimensionAtObservation=AllDimensions&format=csvfilewithlabels")
-TE_API_URL = "https://api.tradingeconomics.com/markets/bond"
-FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={}"
-
-# FRED series IRLTLT01{ISO2}M156N = OECD long-term (10Y) government bond yield, monthly.
-FRED_ISO2 = {
-    "Australia": "AU", "Austria": "AT", "Belgium": "BE", "Brazil": "BR", "Canada": "CA",
-    "Chile": "CL", "China": "CN", "Colombia": "CO", "Czech Republic": "CZ", "Denmark": "DK",
-    "Estonia": "EE", "Finland": "FI", "France": "FR", "Germany": "DE", "Greece": "GR",
-    "Hungary": "HU", "Iceland": "IS", "India": "IN", "Indonesia": "ID", "Ireland": "IE",
-    "Israel": "IL", "Italy": "IT", "Japan": "JP", "South Korea": "KR", "Latvia": "LV",
-    "Lithuania": "LT", "Luxembourg": "LU", "Mexico": "MX", "Netherlands": "NL",
-    "New Zealand": "NZ", "Norway": "NO", "Poland": "PL", "Portugal": "PT", "Russia": "RU",
-    "Slovakia": "SK", "Slovenia": "SI", "South Africa": "ZA", "Spain": "ES", "Sweden": "SE",
-    "Switzerland": "CH", "Turkey": "TR", "United Kingdom": "GB",
-}
+TE_BULK_URL = "https://tradingeconomics.com/forecast/government-bond-10y"   # static table, 22 majors
+TE_COUNTRY_URL = "https://tradingeconomics.com/{slug}/government-bond-yield"       # one country
+# Countries that usually have a 10-year yield page on Trading Economics (fetched on demand).
+TE_EXTRA_COUNTRIES = [
+    "Argentina", "Austria", "Bahrain", "Bangladesh", "Belgium", "Botswana", "Bulgaria", "Chile",
+    "Colombia", "Croatia", "Cyprus", "Czech Republic", "Denmark", "Egypt", "Estonia", "Finland",
+    "Hong Kong", "Hungary", "Iceland", "Indonesia", "Ireland", "Israel", "Jordan", "Kenya", "Latvia",
+    "Lithuania", "Malaysia", "Malta", "Mauritius", "Morocco", "Namibia", "Nigeria", "Norway",
+    "Pakistan", "Peru", "Philippines", "Poland", "Romania", "Serbia", "Singapore", "Slovakia",
+    "Slovenia", "Sri Lanka", "Sweden", "Taiwan", "Thailand", "Uganda", "Ukraine", "Vietnam", "Zambia",
+]
 ALIASES["hong kong china"] = "hong kong"
 
 
@@ -250,107 +246,68 @@ def fetch_tax_rates() -> dict:
             "fetched_at": _now(), "method": "Embedded table", "fallback": True, "errors": errors}
 
 
-def _yields_te_page() -> tuple[dict, dict]:
-    soup = BeautifulSoup(_get(TE_URL).text, "lxml")
-    yields: dict[str, float] = {}
-    dates: dict[str, str] = {}
-    for tr in soup.find_all("tr"):
-        a = tr.find("a", href=re.compile(r"/[a-z-]+/government-bond-yield$"))
-        if not a:
-            continue
-        country = a.get_text(" ", strip=True)
-        cells = [c.get_text(" ", strip=True) for c in tr.find_all("td")]
-        for c in cells[1:]:
-            try:
-                value = float(c.replace("%", "").replace(",", ""))
-            except ValueError:
-                continue
-            if country and country not in yields:
-                yields[country] = value / 100
-                dates[country] = cells[-1] if cells else ""
-            break
-    if not yields:
-        raise ValueError("page loaded but no yield rows were found (table may be JS-rendered)")
-    return yields, dates
+def te_slug(country: str) -> str:
+    t = unicodedata.normalize("NFKD", country).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z]+", "-", t).strip("-")
 
 
-def _yields_te_api() -> tuple[dict, dict]:
-    r = requests.get(TE_API_URL, params={"c": "guest:guest", "f": "json"}, headers=HEADERS,
-                     timeout=15)
-    r.raise_for_status()
-    yields, dates = {}, {}
-    for row in r.json():
-        if str(row.get("URL", "")).endswith("/government-bond-yield") and row.get("Last") is not None:
-            yields[row["Country"]] = float(row["Last"]) / 100
-            dates[row["Country"]] = str(row.get("Date", ""))[:10]
-    if not yields:
-        raise ValueError("API returned no 10Y bond rows")
-    return yields, dates
-
-
-def _fred_last(series_id: str) -> tuple[float, str] | None:
-    r = requests.get(FRED_CSV.format(series_id), headers=HEADERS, timeout=8)
-    if r.status_code != 200:
-        return None
-    df = pd.read_csv(io.StringIO(r.text))
-    df = df.assign(_v=pd.to_numeric(df.iloc[:, 1], errors="coerce")).dropna(subset=["_v"])
-    if df.empty:
-        return None
-    return float(df["_v"].iloc[-1]) / 100, str(df.iloc[-1, 0])
-
-
-def _yields_fred() -> tuple[dict, dict]:
-    from concurrent.futures import ThreadPoolExecutor
-    jobs = {"United States": "DGS10", **{c: f"IRLTLT01{iso}M156N" for c, iso in FRED_ISO2.items()}}
-
-    def one(item):
+def _first_float(cells: list[str]) -> float | None:
+    for c in cells:
         try:
-            return item[0], _fred_last(item[1])
-        except Exception:  # noqa: BLE001
-            return item[0], None
-
-    yields, dates = {}, {}
-    with ThreadPoolExecutor(max_workers=16) as ex:
-        for country, res in ex.map(one, jobs.items()):
-            if res:
-                yields[country], dates[country] = res
-    if not yields:
-        raise ValueError("no series could be downloaded")
-    return yields, dates
+            return float(c.replace(",", "").replace("%", ""))
+        except ValueError:
+            continue
+    return None
 
 
 def fetch_yields() -> dict:
-    """10-year yields (decimal). Trading Economics page -> TE guest API -> FRED/OECD monthly.
-
-    Sources are merged by priority so a country missing from one layer is filled by the next.
-    """
-    layers = [("Trading Economics (page)", _yields_te_page),
-              ("Trading Economics (guest API)", _yields_te_api),
-              ("FRED / OECD monthly", _yields_fred)]
+    """Scrape Trading Economics' static 10-year-yield table (22 major economies, 4-decimal prices)."""
+    soup = BeautifulSoup(_get(TE_BULK_URL, 20).text, "lxml")
+    m = re.search(r"last updated on\s+([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})",
+                  soup.get_text(" "))
+    stamp = m.group(1) if m else ""
     yields: dict[str, float] = {}
-    dates: dict[str, str] = {}
-    sources: dict[str, str] = {}
-    errors: list[str] = []
-    for label, fn in layers:
-        if label.startswith("Trading Economics (guest") and len(yields) >= 30:
+    for tr in soup.find_all("tr"):
+        a = tr.find("a", href=re.compile(r"/[a-z-]+/government-bond-yield/?$"))
+        if not a:
             continue
-        if label.startswith("FRED") and len(yields) >= 30:
+        slug = re.search(r"/([a-z-]+)/government-bond-yield", a["href"]).group(1)
+        v = _first_float([c.get_text(" ", strip=True) for c in tr.find_all("td")][1:])
+        if v is not None:
+            yields[slug.replace("-", " ").title()] = v / 100
+    if len(yields) < 5:
+        raise ValueError(f"only {len(yields)} yield rows found on the Trading Economics page "
+                         "(layout changed or request blocked)")
+    return {"data": yields, "dates": {c: stamp for c in yields},
+            "sources": {c: "Trading Economics" for c in yields}, "errors": [],
+            "method": "Trading Economics 10Y table", "degraded": False,
+            "as_of": stamp or "latest quote", "fetched_at": _now()}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_country_yield(country: str) -> dict:
+    """Scrape one country's Trading Economics page (static HTML) for its 10-year yield."""
+    slug = te_slug(country)
+    soup = BeautifulSoup(_get(TE_COUNTRY_URL.format(slug=slug), 20).text, "lxml")
+    pat = re.compile(rf"/{slug}/government-bond-yield/?$")
+    value, date = None, ""
+    for tr in soup.find_all("tr"):          # the "Bonds | Yield | Day | Month | Year | Date" table
+        if not tr.find("a", href=pat):
             continue
-        try:
-            y, d = fn()
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"{label}: {type(e).__name__}: {str(e)[:120]}")
-            continue
-        for country, v in y.items():
-            if country not in yields:
-                yields[country], dates[country], sources[country] = v, d.get(country, ""), label
-    if not yields:
-        raise ValueError(" | ".join(errors) or "no yield source reachable")
-    used = sorted(set(sources.values()))
-    return {"data": yields, "dates": dates, "sources": sources, "errors": errors,
-            "method": " + ".join(used),
-            "degraded": "Trading Economics (page)" not in used,
-            "as_of": dates.get("United States", "") or "latest quote", "fetched_at": _now()}
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all("td")]
+        value = _first_float(cells[1:])
+        if value is not None:
+            date = cells[-1] if re.fullmatch(r"[A-Z][a-z]{2}/\d{1,2}", cells[-1]) else ""
+            break
+    meta = soup.find("meta", attrs={"name": "description"})
+    md = re.search(r"(?:to|at)\s+(\d+(?:\.\d+)?)%\s+on\s+([A-Z][a-z]+ \d{1,2}, \d{4})",
+                   (meta.get("content") if meta else "") or "")
+    if md:                                   # description carries the full date; prefer it
+        value = value if value is not None else float(md.group(1))
+        date = md.group(2)
+    if value is None:
+        raise ValueError(f"no 10-year yield found on {TE_COUNTRY_URL.format(slug=slug)}")
+    return {"yield": value / 100, "date": date or "latest quote"}
 
 
 def safe(fn):
@@ -453,13 +410,13 @@ def main() -> None:
     betas_df = betas_r["data"] if betas_r else pd.DataFrame(columns=["industry", "unlevered_beta"])
     spread_fetched = spread_r["data"] if spread_r else None
     tax_map = tax_r["data"] if tax_r else {}
-    yields = yld_r["data"] if yld_r else {}
+    yields = dict(yld_r["data"]) if yld_r else {}
+    ydates = dict(yld_r["dates"]) if yld_r else {}
+    ysrc = dict(yld_r["sources"]) if yld_r else {}
+    yfail: list[str] = []
 
     industries = list(betas_df["industry"]) or [DEFAULT_INDUSTRY]
-    countries = sorted(yields) if yields else sorted(
-        {k for k in OECD_FALLBACK_PCT})
-    if DEFAULT_COUNTRY not in countries:
-        countries = [DEFAULT_COUNTRY] + countries
+    countries = sorted(set(yields) | set(TE_EXTRA_COUNTRIES) | {DEFAULT_COUNTRY})
 
     # ---- Sidebar: core inputs -------------------------------------------- #
     with st.sidebar:
@@ -480,6 +437,17 @@ def main() -> None:
                                           default="U.S.") or "U.S."
 
         is_us = norm(country) == "united states"
+
+        # Countries not in the bulk table (or if it failed): scrape their own TE page.
+        for name in dict.fromkeys(["United States", country]):
+            if name not in yields:
+                with st.spinner(f"Fetching {name} 10Y yield…"):
+                    res_y, err_y = safe(lambda n=name: fetch_country_yield(n))
+                if res_y:
+                    yields[name], ydates[name] = res_y["yield"], res_y["date"]
+                    ysrc[name] = "Trading Economics"
+                else:
+                    yfail.append(f"{name}: {err_y}")
 
         st.divider()
         with st.expander("✏️ Manual overrides", expanded=False):
@@ -509,6 +477,16 @@ def main() -> None:
                 st.markdown(f"**{country} 10-year yield**")
                 rf_fc, rf_fc_man = override_field(f"{country} 10Y yield (%)", f"rf_{country}",
                                                   yields.get(country))
+
+    # Summarise the yield source for the sources table.
+    if yld_r is None and (yields.get("United States") is not None or yields.get(country) is not None):
+        yld_r = {"as_of": ydates.get("United States", "latest quote"), "fetched_at": _now(),
+                 "method": "Trading Economics country pages", "errors": [], "degraded": False}
+        yld_err = None
+    if yld_r is not None and yfail:
+        yld_r = {**yld_r, "errors": yld_r.get("errors", []) + yfail}
+    elif yld_r is None and yfail:
+        yld_err = "; ".join(([yld_err] if yld_err else []) + yfail)
 
     # ---- Resolve inputs ---------------------------------------------------- #
     erp, debt = erp_pct / 100, debt_pct / 100
@@ -610,8 +588,7 @@ def main() -> None:
                  r"s^{FC}_{auto}=(1+K_d^{USD})\frac{1+R_f^{FC}}{1+R_f^{US}}-1-R_f^{FC}")
 
     # ---- Inputs used --------------------------------------------------------- #
-    ysrc = (yld_r or {}).get("sources", {})
-    ydate = (yld_r or {}).get("dates", {})
+    ydate = ydates
 
     def row(name, value, manual, source, date=""):
         return (name, value, "✏️ Manual" if manual else source, "—" if manual else (date or "—"))
@@ -717,7 +694,7 @@ def render_sources(betas_r, betas_err, spread_r, spread_err, tax_r, tax_err, yld
         row("Damodaran — unlevered industry betas", BETAS_URL, betas_r, betas_err),
         row("Damodaran — Baa2/BBB spread (large non-financial firms)", RATINGS_URL, spread_r, spread_err),
         row("OECD — statutory corporate tax rates", OECD_URL, tax_r, tax_err),
-        row("Trading Economics — 10-year government yields (U.S. quote date shown)", TE_URL, yld_r, yld_err),
+        row("Trading Economics — 10-year government yields (page date shown)", TE_URL, yld_r, yld_err),
     ]
     st.subheader("Sources & data dates")
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
