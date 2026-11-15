@@ -18,10 +18,14 @@ A Streamlit app that compares a project's **cost of equity, cost of debt and WAC
 |---|---|---|
 | Unlevered industry beta | Damodaran, `betas.xls` | "Unlevered beta" column, US industry averages |
 | BBB spread | Damodaran, `ratings.html` | Baa2/BBB, large non-financial service firms |
-| Corporate tax rate | OECD Corporate Tax Statistics 2024 | Statutory rate, combined central + sub-central |
-| 10-year government yields | Trading Economics `/bonds` | Scraped from the public page, no API key |
+| Corporate tax rate | OECD Corporate Tax Statistics | Combined (central + sub-central) statutory rate, latest year |
+| 10-year government yields | Trading Economics (scraped) | Latest quote per country |
 
-**Fallbacks.** If the OECD table cannot be parsed from the live page, the app uses an embedded copy of the OECD 2024 rates and labels it "Fallback" in the sources table. If any source fails, the app says so and you can type the value in under *Manual overrides*.
+**How the OECD and Trading Economics data are fetched.** Those two sites are the hardest to scrape, so each is tried in layers; the *Sources & data dates* table shows which layer worked and why earlier ones failed.
+
+- **OECD tax rates:** (1) the OECD Data Explorer SDMX API (`DSD_TAX_CIT@DF_CIT`, the data behind the Corporate Tax Statistics tables; the publication page itself loads its table dynamically, so scraping it usually fails) → (2) the publication page → (3) an embedded copy of the OECD 2024 table, labelled as a fallback.
+- **10-year yields (scraping only, no API):** the `tradingeconomics.com/bonds` list is filled in by JavaScript, so it cannot be scraped. Instead the app reads Trading Economics' static pages: (1) the 10-year table at `/forecast/government-bond-10y`, which lists 22 major economies (US, UK, Japan, Germany, Brazil, India, Canada, Italy, France, South Africa, China, Switzerland, Mexico, Korea, Spain, Turkey, …) in one request; (2) for any other country, that country's own page (`/<country>/government-bond-yield`), fetched when you select it. The U.S. yield comes from (1), or from the U.S. page if (1) fails.
+- If a source fails, the app says so and you can type the value in under *Manual overrides*.
 
 ## Model (verify against your course formulas)
 
@@ -78,8 +82,9 @@ streamlit run app.py
 
 ## Limitations
 
-- The OECD and Trading Economics pages are scraped, so a change to their layout can break the fetch; the app then falls back or asks for manual input. Trading Economics may also block requests from some cloud hosts. Check their terms of use for your purposes.
-- The OECD publication is annual; the Trading Economics yield is a live quote, so the data dates differ by source.
-- Countries in the dropdown are those with a 10-year yield on Trading Economics. If a country has no tax rate in the OECD data, enter it manually.
-- Data is cached for one hour; use **Refresh data** to re-fetch.
+- Trading Economics may block automated requests from some cloud hosts; if so, the sources table shows the error and you can type the yield into *Manual overrides*. Check their terms of use for your purposes.
+- Source pages can change layout; the app then shows the reason in the sources table.
+- Data dates differ by source: OECD rates are annual, Trading Economics yields are the latest quote (the page's update date is shown), Damodaran data is as of the date on his page.
+- The country dropdown lists the major economies plus other countries that normally have a Trading Economics 10-year page; if a country has no page or no OECD tax rate, enter the value manually.
+- Data is cached for 30 minutes; use **Refresh data** to re-fetch.
 - Educational tool, not investment advice.
